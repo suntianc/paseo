@@ -1355,6 +1355,7 @@ export class AgentManager {
       workspaceId?: string;
       owner?: AgentOwner;
       attention?: AttentionState;
+      lastError?: string;
     },
     resumeOptions?: AgentResumeSessionOptions,
   ): Promise<ManagedAgent> {
@@ -1387,6 +1388,7 @@ export class AgentManager {
       workspaceId?: string;
       owner?: AgentOwner;
       attention?: AttentionState;
+      lastError?: string;
     },
     resumeOptions?: AgentResumeSessionOptions,
   ): Promise<ManagedAgent> {
