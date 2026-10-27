@@ -58,4 +58,3 @@ Node.js v22.21.0
       Tests  1 failed | 43 skipped (44)
    Start at  18:17:12
    Duration  3.10s (transform 633ms, setup 16ms, import 922ms, tests 2.10s, environment 0ms)
-
