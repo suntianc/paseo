@@ -1,0 +1,267 @@
+name: Upstream Auto Rebase
+
+on:
+  schedule:
+    # Run daily at 01:00 UTC (09:00 CST)
+    - cron: "0 1 * * *"
+  workflow_dispatch:
+    inputs:
+      upstream_repo:
+        description: "Upstream repository (owner/repo)"
+        required: false
+        default: "getpaseo/paseo"
+        type: string
+      upstream_branch:
+        description: "Upstream branch to rebase onto"
+        required: false
+        default: "main"
+        type: string
+      base_branch:
+        description: "Fork branch containing custom commits"
+        required: false
+        default: "main"
+        type: string
+      sync_mode:
+        description: "Action when rebase succeeds without conflicts"
+        required: false
+        default: "update-base"
+        type: choice
+        options:
+          - update-base
+          - branch-only
+
+concurrency:
+  group: upstream-rebase-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  rebase:
+    name: Rebase onto upstream
+    if: github.repository != 'getpaseo/paseo'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
+      SSH_DEPLOY_KEY: ${{ secrets.UPSTREAM_SYNC_SSH_KEY }}
+      UPSTREAM_REPO: ${{ inputs.upstream_repo || 'getpaseo/paseo' }}
+      UPSTREAM_BRANCH: ${{ inputs.upstream_branch || 'main' }}
+      BASE_BRANCH: ${{ inputs.base_branch || 'main' }}
+      SYNC_MODE: ${{ inputs.sync_mode || 'update-base' }}
+      CONFLICT_LABEL: "upstream-rebase-conflict"
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.base_branch || 'main' }}
+          fetch-depth: 0
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
+
+      - name: Configure SSH deploy key (if provided)
+        if: env.SSH_DEPLOY_KEY != ''
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "${SSH_DEPLOY_KEY}" > ~/.ssh/upstream_sync_key
+          chmod 600 ~/.ssh/upstream_sync_key
+          ssh-keyscan -t ed25519,rsa github.com >> ~/.ssh/known_hosts 2>/dev/null
+          git config core.sshCommand "ssh -i ~/.ssh/upstream_sync_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes"
+          git remote set-url --push origin "git@github.com:${GITHUB_REPOSITORY}.git"
+
+      - name: Rebase custom commits onto upstream
+        id: rebase
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if ! git remote get-url upstream >/dev/null 2>&1; then
+            git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          else
+            git remote set-url upstream "https://github.com/${UPSTREAM_REPO}.git"
+          fi
+
+          git fetch origin "${BASE_BRANCH}"
+          git fetch upstream "${UPSTREAM_BRANCH}"
+
+          ORIGIN_SHA=$(git rev-parse "origin/${BASE_BRANCH}")
+          ORIGIN_SHORT=$(git rev-parse --short "origin/${BASE_BRANCH}")
+          UPSTREAM_SHA=$(git rev-parse "upstream/${UPSTREAM_BRANCH}")
+          UPSTREAM_SHORT=$(git rev-parse --short "upstream/${UPSTREAM_BRANCH}")
+          MERGE_BASE=$(git merge-base "origin/${BASE_BRANCH}" "upstream/${UPSTREAM_BRANCH}")
+          MERGE_BASE_SHORT=$(git rev-parse --short "${MERGE_BASE}")
+
+          if git merge-base --is-ancestor "${UPSTREAM_SHA}" "${ORIGIN_SHA}"; then
+            echo "status=up-to-date" >> "$GITHUB_OUTPUT"
+            {
+              echo "### Upstream Auto Rebase: Up to Date"
+              echo "- **Upstream**: \`${UPSTREAM_REPO}:${UPSTREAM_BRANCH}\` (\`${UPSTREAM_SHORT}\`)"
+              echo "- **Fork branch**: \`${BASE_BRANCH}\` (\`${ORIGIN_SHORT}\`)"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          DATE_UTC=$(date -u +%Y%m%d)
+          NEW_BRANCH="rebase/upstream-${DATE_UTC}-${UPSTREAM_SHORT}"
+          BACKUP_BRANCH="backup/${BASE_BRANCH}-${DATE_UTC}-${ORIGIN_SHORT}"
+          CUSTOM_COMMITS=$(git log --oneline --no-merges "${MERGE_BASE}..origin/${BASE_BRANCH}" || true)
+          UPSTREAM_COUNT=$(git rev-list --count "${MERGE_BASE}..upstream/${UPSTREAM_BRANCH}")
+          DELIMITER="EOF_$(openssl rand -hex 8)"
+
+          git checkout -B "${NEW_BRANCH}" "origin/${BASE_BRANCH}"
+
+          set +e
+          REBASE_OUTPUT=$(git rebase --empty=drop "upstream/${UPSTREAM_BRANCH}" 2>&1)
+          REBASE_EXIT=$?
+          set -e
+
+          if [ "$REBASE_EXIT" -eq 0 ]; then
+            echo "status=rebased" >> "$GITHUB_OUTPUT"
+            echo "new_branch=${NEW_BRANCH}" >> "$GITHUB_OUTPUT"
+            echo "backup_branch=${BACKUP_BRANCH}" >> "$GITHUB_OUTPUT"
+            echo "upstream_short=${UPSTREAM_SHORT}" >> "$GITHUB_OUTPUT"
+            echo "origin_short=${ORIGIN_SHORT}" >> "$GITHUB_OUTPUT"
+            echo "merge_base_short=${MERGE_BASE_SHORT}" >> "$GITHUB_OUTPUT"
+            echo "upstream_count=${UPSTREAM_COUNT}" >> "$GITHUB_OUTPUT"
+            {
+              echo "custom_commits<<${DELIMITER}"
+              echo "${CUSTOM_COMMITS:-"(none)"}"
+              echo "${DELIMITER}"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          CONFLICT_COMMIT=$(git log -1 --format="%h %s" REBASE_HEAD 2>/dev/null || echo "unknown")
+          CONFLICT_FILES=$(git diff --name-only --diff-filter=U || true)
+          git rebase --abort || true
+
+          echo "status=conflict" >> "$GITHUB_OUTPUT"
+          echo "new_branch=${NEW_BRANCH}" >> "$GITHUB_OUTPUT"
+          echo "upstream_short=${UPSTREAM_SHORT}" >> "$GITHUB_OUTPUT"
+          echo "origin_short=${ORIGIN_SHORT}" >> "$GITHUB_OUTPUT"
+          echo "merge_base_short=${MERGE_BASE_SHORT}" >> "$GITHUB_OUTPUT"
+          echo "upstream_count=${UPSTREAM_COUNT}" >> "$GITHUB_OUTPUT"
+          echo "conflict_commit=${CONFLICT_COMMIT}" >> "$GITHUB_OUTPUT"
+          {
+            echo "conflict_files<<${DELIMITER}"
+            echo "${CONFLICT_FILES:-"(unknown)"}"
+            echo "${DELIMITER}"
+            echo "custom_commits<<${DELIMITER}"
+            echo "${CUSTOM_COMMITS:-"(none)"}"
+            echo "${DELIMITER}"
+            echo "rebase_output<<${DELIMITER}"
+            echo "${REBASE_OUTPUT}" | tail -n 80
+            echo "${DELIMITER}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Push rebased branch
+        if: steps.rebase.outputs.status == 'rebased'
+        env:
+          NEW_BRANCH: ${{ steps.rebase.outputs.new_branch }}
+          BACKUP_BRANCH: ${{ steps.rebase.outputs.backup_branch }}
+          UPSTREAM_SHORT: ${{ steps.rebase.outputs.upstream_short }}
+          ORIGIN_SHORT: ${{ steps.rebase.outputs.origin_short }}
+          MERGE_BASE_SHORT: ${{ steps.rebase.outputs.merge_base_short }}
+          UPSTREAM_COUNT: ${{ steps.rebase.outputs.upstream_count }}
+          CUSTOM_COMMITS: ${{ steps.rebase.outputs.custom_commits }}
+        run: |
+          set -euo pipefail
+
+          git push --force-with-lease origin "${NEW_BRANCH}"
+
+          if [ "${SYNC_MODE}" = "update-base" ]; then
+            git push --force origin "origin/${BASE_BRANCH}:refs/heads/${BACKUP_BRANCH}"
+            git push --force-with-lease origin "${NEW_BRANCH}:refs/heads/${BASE_BRANCH}"
+          fi
+
+          {
+            echo "### Upstream Auto Rebase: Success"
+            echo "- **Upstream**: \`${UPSTREAM_REPO}:${UPSTREAM_BRANCH}\` (\`${MERGE_BASE_SHORT}..${UPSTREAM_SHORT}\`, ${UPSTREAM_COUNT} new commits)"
+            echo "- **Rebased branch**: \`${NEW_BRANCH}\`"
+            if [ "${SYNC_MODE}" = "update-base" ]; then
+              echo "- **Updated base branch**: \`${BASE_BRANCH}\` (previous \`${ORIGIN_SHORT}\` backed up to \`${BACKUP_BRANCH}\`)"
+            fi
+            echo ""
+            echo "#### Rebased Custom Commits"
+            echo '```text'
+            echo "${CUSTOM_COMMITS}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Auto-close any open conflict issue once rebase succeeds
+          OPEN_ISSUES=$(gh issue list --repo "${GITHUB_REPOSITORY}" --state open --label "${CONFLICT_LABEL}" --json number --jq '.[].number' || true)
+          for ISSUE_NUM in ${OPEN_ISSUES}; do
+            gh issue close "${ISSUE_NUM}" --repo "${GITHUB_REPOSITORY}" --comment "Resolved: clean rebase succeeded onto \`${UPSTREAM_SHORT}\` in branch \`${NEW_BRANCH}\`." || true
+          done
+
+      - name: Create or update conflict Issue for AI intervention
+        if: steps.rebase.outputs.status == 'conflict'
+        env:
+          NEW_BRANCH: ${{ steps.rebase.outputs.new_branch }}
+          UPSTREAM_SHORT: ${{ steps.rebase.outputs.upstream_short }}
+          ORIGIN_SHORT: ${{ steps.rebase.outputs.origin_short }}
+          MERGE_BASE_SHORT: ${{ steps.rebase.outputs.merge_base_short }}
+          UPSTREAM_COUNT: ${{ steps.rebase.outputs.upstream_count }}
+          CONFLICT_COMMIT: ${{ steps.rebase.outputs.conflict_commit }}
+          CONFLICT_FILES: ${{ steps.rebase.outputs.conflict_files }}
+          CUSTOM_COMMITS: ${{ steps.rebase.outputs.custom_commits }}
+          REBASE_OUTPUT: ${{ steps.rebase.outputs.rebase_output }}
+        run: |
+          set -euo pipefail
+
+          gh api -X PATCH "repos/${GITHUB_REPOSITORY}" -f has_issues=true >/dev/null 2>&1 || true
+          gh label create "${CONFLICT_LABEL}" --repo "${GITHUB_REPOSITORY}" --color "d93f0b" --description "Upstream auto-rebase conflict requiring AI intervention" --force >/dev/null 2>&1 || true
+
+          ISSUE_TITLE="[Upstream Rebase Conflict] ${BASE_BRANCH} onto ${UPSTREAM_REPO}@${UPSTREAM_SHORT}"
+          ISSUE_BODY=$(cat <<EOF
+          ## Automatic Upstream Rebase Hit a Conflict
+
+          - **Upstream target**: \`${UPSTREAM_REPO}:${UPSTREAM_BRANCH}\` (\`${MERGE_BASE_SHORT}..${UPSTREAM_SHORT}\`, ${UPSTREAM_COUNT} new commits)
+          - **Fork branch**: \`${BASE_BRANCH}\` (\`${ORIGIN_SHORT}\`)
+          - **First conflicting commit**: \`${CONFLICT_COMMIT}\`
+
+          ### Conflicting Files
+          \`\`\`text
+          ${CONFLICT_FILES}
+          \`\`\`
+
+          ### Custom Commits Being Rebased
+          \`\`\`text
+          ${CUSTOM_COMMITS}
+          \`\`\`
+
+          ### Rebase Output
+          \`\`\`text
+          ${REBASE_OUTPUT}
+          \`\`\`
+
+          ---
+
+          ### Local AI Handoff Prompt / Commands
+          Copy the following prompt to your local coding agent (Claude Code / Codex / Pi):
+
+          \`\`\`text
+          请帮我把当前仓库的 ${BASE_BRANCH} 分支 rebase 到官方最新 upstream/${UPSTREAM_BRANCH} (${UPSTREAM_SHORT}) 并解决冲突：
+          1. git fetch origin && git fetch upstream ${UPSTREAM_BRANCH}
+          2. git checkout -B ${NEW_BRANCH} origin/${BASE_BRANCH}
+          3. git rebase --empty=drop upstream/${UPSTREAM_BRANCH}
+          4. 解决冲突（首个冲突提交：${CONFLICT_COMMIT}，冲突文件见上），跑通 npm run typecheck && npm run lint
+          5. 推回远端：git push --force-with-lease origin ${NEW_BRANCH}:${BASE_BRANCH}
+          \`\`\`
+          EOF
+          )
+
+          EXISTING_ISSUE=$(gh issue list --repo "${GITHUB_REPOSITORY}" --state open --label "${CONFLICT_LABEL}" --json number --jq '.[0].number // empty' || true)
+          if [ -n "${EXISTING_ISSUE}" ]; then
+            gh issue edit "${EXISTING_ISSUE}" --repo "${GITHUB_REPOSITORY}" --title "${ISSUE_TITLE}" --body "${ISSUE_BODY}"
+            gh issue comment "${EXISTING_ISSUE}" --repo "${GITHUB_REPOSITORY}" --body "Updated conflict details for \`${UPSTREAM_REPO}@${UPSTREAM_SHORT}\`."
+          else
+            gh issue create --repo "${GITHUB_REPOSITORY}" --title "${ISSUE_TITLE}" --label "${CONFLICT_LABEL}" --body "${ISSUE_BODY}"
+          fi
+
+          exit 1
